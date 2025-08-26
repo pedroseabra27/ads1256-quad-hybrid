@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools", "wheel", "Cython>=0.29", "numpy"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ads1256-quad-hybrid"
+version = "0.0.1"
+description = "Hybrid C/Cython/Python system for 4x ADS1256 acquisition"
+readme = "README.md"
+license = { text = "GPL-2.0" }
+authors = [ { name = "Manus AI" } ]
+requires-python = ">=3.9"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+dev = ["pytest", "black", "mypy", "flake8"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

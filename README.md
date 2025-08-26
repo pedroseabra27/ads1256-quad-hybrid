@@ -2,7 +2,7 @@
 
 High-performance hybrid C / Cython / Python framework for managing 4 ADS1256 24‑bit ADC devices across 2 SPI buses (SPI0 & SPI1) with synchronization, real-time options and performance monitoring.
 
-Este repositório é um esqueleto inicial (skeleton) baseado na documentação fornecida. Você pode expandir gradualmente até a implementação completa.
+Este repositório agora contém a estrutura inicial do core C, API Python e documentação separada em `docs/` baseada no material completo fornecido.
 
 ## Summary / Resumo
 
@@ -48,21 +48,25 @@ with system.acquisition_context():
 ## Project Layout
 
 ```
+docs/                    # Detailed architecture & usage docs
 src/
-  ads1256_core/      # C core (SPI, buffering, sync stubs)
-  ads1256_quad_api/  # Cython + Python high-level API
-examples/            # Usage examples
-scripts/             # CLI tools & services
-.github/             # CI, issue templates
+  ads1256_core/          # C core (headers in include/, synthetic stubs)
+  ads1256_quad_api/      # Python high-level API (Cython bridge TBD)
+examples/                # Usage examples
+tests/                   # Pytests
 ```
+
+Key docs:
+* `docs/ARCHITECTURE.md`
+* `docs/CONFIGURATION.md`
+* `docs/ACQUISITION.md`
+* `docs/PERFORMANCE.md`
+* `docs/TESTING.md`
+* `docs/ROADMAP.md`
 
 ## Roadmap (Short)
 
-1. Implement real SPI read sequence (reset, register config, continuous read)
-2. Add acquisition thread + ring buffer real
-3. Implement GPIO sync (libgpiod) pulses & timestamping
-4. Add calibration and voltage conversion based on Vref & gain
-5. Performance optimization (affinity, hugepages optional, lock-free queue)
+See `docs/ROADMAP.md`.
 
 ## Contributing
 
