@@ -23,6 +23,7 @@ struct ads1256_system_s {
     int thread_running;
     pthread_t thread;
     uint64_t seq_counter;
+    ads1256_metrics_t metrics;
 };
 
 static int write_reg(ads1256_spi_dev_t *dev, uint8_t reg, uint8_t value) {
@@ -46,8 +47,10 @@ static int write_regs(ads1256_spi_dev_t *dev, uint8_t start_reg, const uint8_t *
     return ads1256_spi_write(dev, buf, 2 + count);
 }
 
+// Minimal settling delay between ADS1256 command phases / MUX changes.
+// Currently a fixed 40us; will be replaced by DRDY-based wait later.
 static int wait_short() {
-    struct timespec ts = {0, 500000}; // 0.5ms
+    struct timespec ts = {0, 40000}; // 40us
     nanosleep(&ts, NULL);
     return 0;
 }
@@ -108,6 +111,9 @@ int ads1256_system_create(const ads1256_system_cfg_t *cfg, ads1256_system_t **ou
     s->ring_ready = 0;
     s->thread_running = 0;
     s->seq_counter = 0;
+    memset(&s->metrics, 0, sizeof(s->metrics));
+    s->metrics.device_count = s->cfg.device_count;
+    s->metrics.channels_total = s->cfg.device_count * 8;
     *out = s;
     return ADS1256_OK;
 }
@@ -279,10 +285,34 @@ static void *acq_thread_func(void *arg) {
         if(r > 0) {
             for(int i=0;i<total;i++) frame.volts[i] = volts[i];
             ads1256_ring_push(&sys->ring, &frame);
+            // Metrics update
+            sys->metrics.frames_produced++;
+            uint64_t now = frame.timestamp_ns;
+            if(sys->metrics.last_frame_timestamp_ns != 0) {
+                double period = (double)(now - sys->metrics.last_frame_timestamp_ns);
+                if(sys->metrics.avg_frame_period_ns == 0) sys->metrics.avg_frame_period_ns = period;
+                else sys->metrics.avg_frame_period_ns = 0.9 * sys->metrics.avg_frame_period_ns + 0.1 * period;
+            }
+            sys->metrics.last_frame_timestamp_ns = frame.timestamp_ns;
+            sys->metrics.dropped_frames = sys->ring.dropped;
         }
-        // Simple pacing: remove once real DRDY event-driven logic added
-        struct timespec ts = {0, 1000000}; // 1ms
-        nanosleep(&ts, NULL);
+        // Pacing: approximate frame period = (channels_per_device * 1e9) / sample_rate
+        // Using first device's sample_rate as reference (assumes uniform configuration).
+        int sr = 0;
+        if(sys->cfg.device_count > 0) sr = sys->cfg.devices[0].sample_rate;
+        if(sr <= 0) sr = 7500; // fallback
+        double frame_period_ns = (8.0 * 1e9) / (double)sr; // sequential scanning cost
+        uint64_t now_ns = monotonic_ns();
+        uint64_t elapsed = now_ns - frame.timestamp_ns;
+        if(elapsed < (uint64_t)frame_period_ns) {
+            uint64_t remain = (uint64_t)frame_period_ns - elapsed;
+            // sleep remaining time (coarse): cap to 2ms to avoid long oversleeps
+            if(remain > 2000000ull) remain = 2000000ull;
+            struct timespec ts;
+            ts.tv_sec = 0;
+            ts.tv_nsec = (long)remain;
+            nanosleep(&ts, NULL);
+        }
     }
     return NULL;
 }
@@ -327,4 +357,34 @@ int ads1256_system_get_dropped(ads1256_system_t *sys, unsigned long long *out_dr
     if(!sys->ring_ready) { *out_dropped = 0; return ADS1256_OK; }
     *out_dropped = sys->ring.dropped;
     return ADS1256_OK;
+}
+
+int ads1256_system_get_metrics(ads1256_system_t *sys, ads1256_metrics_t *out) {
+    if(!sys || !out) return ADS1256_ERR_INVALID_ARG;
+    *out = sys->metrics;
+    return ADS1256_OK;
+}
+
+int ads1256_system_wait_drdy(ads1256_system_t *sys, int device_index, int timeout_ms) {
+    if(!sys) return ADS1256_ERR_INVALID_ARG;
+    if(device_index < 0 || device_index >= sys->cfg.device_count) return ADS1256_ERR_INVALID_ARG;
+    // Placeholder: no GPIO integration yet. We approximate wait by sleeping a short fraction of expected sample period.
+    int sr = sys->cfg.devices[device_index].sample_rate;
+    if(sr <= 0) sr = 7500;
+    double sample_period_ns = 1e9 / (double)sr;
+    // Sleep min(sample_period/4, 500us) while decrementing timeout.
+    int waited_ms = 0;
+    int step_us = (int)(sample_period_ns / 4.0 / 1000.0);
+    if(step_us <= 0) step_us = 50; // 50us
+    if(step_us > 500000) step_us = 500000;
+    while(waited_ms < timeout_ms) {
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = step_us * 1000;
+        nanosleep(&ts, NULL);
+        waited_ms += (step_us / 1000);
+        // Without GPIO can't detect readiness; assume ready after first interval.
+        return 1;
+    }
+    return 0; // timeout
 }

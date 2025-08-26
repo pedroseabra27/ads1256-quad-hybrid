@@ -16,6 +16,8 @@ typedef struct {
     int spi_bus;        // 0 or 1
     int chip_select;    // 0 or 1
     int sample_rate;    // SPS
+    int drdy_chip;      // gpiochip index (Linux) or -1 if unused
+    int drdy_line;      // line offset within chip or -1 if unused
     size_t buffer_size; // bytes allocated for ring
     int auto_calibration;
     int channel_count;  // actual channels configured

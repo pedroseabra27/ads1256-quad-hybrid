@@ -11,6 +11,7 @@ cdef extern from "ads1256_core/ads1256_system.h":
     cdef int ads1256_system_get_dropped(ads1256_system_t *sys, unsigned long long *out_dropped)
     cdef int ads1256_system_read_frame(ads1256_system_t *sys, float *out_volts)
     cdef int ads1256_system_read_frame_raw(ads1256_system_t *sys, int *out_raw)
+    cdef int ads1256_system_get_metrics(ads1256_system_t *sys, ads1256_metrics_t *out)
 
 cdef extern from "ads1256_core/ads1256_types.h":
     ctypedef struct ads1256_channel_cfg_t:
@@ -43,3 +44,12 @@ cdef extern from "ads1256_core/ads1256_frame.h":
         int device_count
         int channels_per_device
         float volts[32]
+
+cdef extern from "ads1256_core/ads1256_metrics.h":
+    ctypedef struct ads1256_metrics_t:
+        unsigned long long frames_produced
+        unsigned long long dropped_frames
+        unsigned long long last_frame_timestamp_ns
+        double avg_frame_period_ns
+        int device_count
+        int channels_total

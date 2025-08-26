@@ -109,3 +109,21 @@ cdef class CoreSystem:
         if ccore.ads1256_system_get_dropped(self.sys, &d) != 0:
             raise RuntimeError("metric error")
         return d
+
+    def get_metrics(self):
+        """Return a dict with current acquisition metrics plus derived throughput."""
+        if self.sys == NULL:
+            return None
+        cdef ads1256_metrics_t* m = ads1256_system_get_metrics(self.sys)
+        if m == NULL:
+            return None
+        d = {
+            "frames_produced": m.frames_produced,
+            "dropped_frames": m.dropped_frames,
+            "avg_frame_period_ns": m.avg_frame_period_ns,
+        }
+        if m.avg_frame_period_ns > 0:
+            d["throughput_fps"] = 1e9 / m.avg_frame_period_ns
+        else:
+            d["throughput_fps"] = 0.0
+        return d

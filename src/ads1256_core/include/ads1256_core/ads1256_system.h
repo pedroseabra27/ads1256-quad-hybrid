@@ -4,6 +4,7 @@
 #include "ads1256_error.h"
 #include "ads1256_types.h"
 #include "ads1256_frame.h"
+#include "ads1256_metrics.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -40,6 +41,13 @@ int ads1256_system_pop_frame(ads1256_system_t *sys, ads1256_frame_t *out_frame);
 
 // Simple metrics: dropped frames (ring overwrites). Returns 0 on success.
 int ads1256_system_get_dropped(ads1256_system_t *sys, unsigned long long *out_dropped);
+
+// Copy current metrics snapshot
+int ads1256_system_get_metrics(ads1256_system_t *sys, ads1256_metrics_t *out);
+
+// Experimental: non-blocking check or blocking wait for DRDY (returns 1 ready, 0 timeout, <0 error)
+// Placeholder until libgpiod integration implemented.
+int ads1256_system_wait_drdy(ads1256_system_t *sys, int device_index, int timeout_ms);
 
 #ifdef __cplusplus
 }
