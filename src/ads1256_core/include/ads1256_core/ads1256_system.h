@@ -38,6 +38,8 @@ int ads1256_system_read_frame_raw(ads1256_system_t *sys, int32_t *out_raw);
 int ads1256_system_start_thread(ads1256_system_t *sys);
 int ads1256_system_stop_thread(ads1256_system_t *sys);
 int ads1256_system_pop_frame(ads1256_system_t *sys, ads1256_frame_t *out_frame); // returns 1 frame, 0 empty, <0 error
+// Zero-copy variant: returns internal frame pointer (valid until that slot reused after ring wraps)
+int ads1256_system_pop_frame_ref(ads1256_system_t *sys, const ads1256_frame_t **out_frame);
 
 // Simple metrics: dropped frames (ring overwrites). Returns 0 on success.
 int ads1256_system_get_dropped(ads1256_system_t *sys, unsigned long long *out_dropped);

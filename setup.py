@@ -8,6 +8,7 @@ sources = [
     "src/ads1256_core/ads1256_system.c",
     "src/ads1256_core/ads1256_spi.c",
     "src/ads1256_core/ads1256_ring.c",
+    "src/ads1256_core/ads1256_gpio.c",
 ]
 
 ext = Extension(

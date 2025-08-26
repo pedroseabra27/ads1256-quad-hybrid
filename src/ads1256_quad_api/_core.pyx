@@ -96,6 +96,43 @@ cdef class CoreSystem:
         else:
             raise RuntimeError("pop_frame error")
 
+    def pop_frame_np(self):
+        """Fast path returning (timestamp_ns, seq, numpy_float32_array) or None.
+        Currently copies from internal struct (32 floats)."""
+        cdef ccore.ads1256_frame_t frame
+        r = ccore.ads1256_system_pop_frame(self.sys, &frame)
+        if r == 1:
+            total_channels = frame.device_count * frame.channels_per_device
+            if total_channels > 32:
+                total_channels = 32
+            arr = np.empty(total_channels, dtype=np.float32)
+            for i in range(total_channels):
+                arr[i] = frame.volts[i]
+            return frame.timestamp_ns, frame.seq, arr
+        elif r == 0:
+            return None
+        else:
+            raise RuntimeError("pop_frame_np error")
+
+    def pop_frame_view(self):
+        """Zero-copy view: returns (timestamp_ns, seq, memoryview[float32]) or None.
+        Warning: the underlying data slot may be overwritten after more frames are pushed;
+        consume or copy promptly if you need persistence."""
+        cdef ccore.ads1256_frame_t *ref
+        cdef ccore.ads1256_frame_t **ref_ptr = &ref
+        r = ccore.ads1256_system_pop_frame_ref(self.sys, ref_ptr)
+        if r == 1:
+            cdef int total_channels = ref.device_count * ref.channels_per_device
+            if total_channels > 32:
+                total_channels = 32
+            # Create typed memoryview directly referencing C array
+            cdef float[:] mv = ref.volts[:total_channels]
+            return ref.timestamp_ns, ref.seq, mv
+        elif r == 0:
+            return None
+        else:
+            raise RuntimeError("pop_frame_view error")
+
     def read_frame_blocking(self):
         cdef int dev_channels = 4 * 8
         cdef float[::1] buf = np.empty(dev_channels, dtype=np.float32)
@@ -121,6 +158,12 @@ cdef class CoreSystem:
             "frames_produced": m.frames_produced,
             "dropped_frames": m.dropped_frames,
             "avg_frame_period_ns": m.avg_frame_period_ns,
+            "last_frame_acq_ns": m.last_frame_acq_ns,
+            "avg_frame_acq_ns": m.avg_frame_acq_ns,
+            "drdy_waits": m.drdy_waits,
+            "drdy_timeouts": m.drdy_timeouts,
+            "last_drdy_wait_ns": m.last_drdy_wait_ns,
+            "avg_drdy_wait_ns": m.avg_drdy_wait_ns,
         }
         if m.avg_frame_period_ns > 0:
             d["throughput_fps"] = 1e9 / m.avg_frame_period_ns

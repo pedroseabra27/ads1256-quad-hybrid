@@ -8,14 +8,20 @@ Este repositório agora contém a estrutura inicial do core C, API Python e docu
 
 | Feature | Status |
 |---------|--------|
-| 4 devices (ADS1256) | Skeleton (fake data) |
-| Dual SPI (SPI0/SPI1) | Config structure only |
-| Hardware sync (GPIO) | Stub (libgpiod planned) |
-| DMA | Not implemented |
-| Real-time (SCHED_FIFO) | Placeholder configuration |
-| Zero-copy NumPy | Partial (direct buffer copy) |
-| Benchmarks | Basic throughput stub |
-| Export (csv/hdf5/mat) | Implemented (mat via scipy) |
+| 4 devices (ADS1256) | Implemented (sequential + parallel per bus) |
+| Dual SPI (SPI0/SPI1) | Active (bus worker threads) |
+| RDATAC mode | Basic (MUX sweep with discard+read) |
+| DRDY (GPIO) | Abstraction + metrics (libgpiod integration flag pending) |
+| Zero-copy frame access | Implemented (`pop_frame_view`) |
+| Per-channel gain scaling | Implemented |
+| Multi-thread acquisition | Main + per-bus workers |
+| Metrics (throughput, latency, DRDY) | Implemented (EMA + counts) |
+| Trigger/Burst | Pending |
+| Sync quality metric | Pending |
+| Config loader | Pending |
+| Logging structured | Pending |
+| Export (csv/hdf5/parquet) | Pending (not implemented yet) |
+| Tests / CI | Minimal (import only) |
 
 Badge (CI): ![CI](https://github.com/pedroseabra27/ads1256-quad-hybrid/actions/workflows/ci.yml/badge.svg)
 
@@ -26,6 +32,13 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e .[dev]
 # (compila extensão Cython; se falhar use: python setup.py build_ext --inplace)
+
+# Optional: enable libgpiod DRDY edge timing (Linux/RPi)
+# Install system dependency:
+#   sudo apt update && sudo apt install -y libgpiod-dev gpiod
+# Build with flag:
+#   CFLAGS="-DADS1256_HAVE_GPIOD" pip install -e .
+# Or set environment before building the extension.
 ```
 
 ## Quick Test

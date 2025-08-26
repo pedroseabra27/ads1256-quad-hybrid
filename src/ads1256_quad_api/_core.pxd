@@ -8,6 +8,7 @@ cdef extern from "ads1256_core/ads1256_system.h":
     cdef int ads1256_system_start_thread(ads1256_system_t *sys)
     cdef int ads1256_system_stop_thread(ads1256_system_t *sys)
     cdef int ads1256_system_pop_frame(ads1256_system_t *sys, ads1256_frame_t *out_frame)
+    cdef int ads1256_system_pop_frame_ref(ads1256_system_t *sys, ads1256_frame_t **out_frame)
     cdef int ads1256_system_get_dropped(ads1256_system_t *sys, unsigned long long *out_dropped)
     cdef int ads1256_system_read_frame(ads1256_system_t *sys, float *out_volts)
     cdef int ads1256_system_read_frame_raw(ads1256_system_t *sys, int *out_raw)
@@ -51,5 +52,9 @@ cdef extern from "ads1256_core/ads1256_metrics.h":
         unsigned long long dropped_frames
         unsigned long long last_frame_timestamp_ns
         double avg_frame_period_ns
+    unsigned long long last_frame_acq_ns
+    double avg_frame_acq_ns
+    unsigned long long drdy_waits
+    unsigned long long drdy_timeouts
         int device_count
         int channels_total

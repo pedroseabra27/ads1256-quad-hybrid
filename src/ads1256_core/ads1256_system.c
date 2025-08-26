@@ -8,6 +8,7 @@
 #include "include/ads1256_core/ads1256_regs.h"
 #include "include/ads1256_core/ads1256_ring.h"
 #include "include/ads1256_core/ads1256_frame.h"
+#include "include/ads1256_core/ads1256_gpio.h"
 #ifdef __linux__
 #include <pthread.h>
 #endif
@@ -17,6 +18,7 @@ struct ads1256_system_s {
     int running;
     unsigned long synthetic_counter;
     ads1256_spi_dev_t spi_devs[4]; // future multi devices
+    int drdy_handles[4];
     int hw_initialized;
     ads1256_ring_t ring;
     int ring_ready;
@@ -24,6 +26,19 @@ struct ads1256_system_s {
     pthread_t thread;
     uint64_t seq_counter;
     ads1256_metrics_t metrics;
+    int32_t *raw_buf;
+    size_t raw_buf_len;
+    int use_rdatac;
+    // Bus workers (up to 2 SPI buses)
+    int bus_worker_enabled[2];
+    pthread_t bus_threads[2];
+    int bus_thread_running[2];
+    // Synchronization
+    pthread_mutex_t bus_mutex[2];
+    pthread_cond_t  bus_cond[2];
+    pthread_cond_t  bus_done_cond[2];
+    int bus_request[2]; // incremented to signal work
+    int bus_done[2];    // increments when work finished
 };
 
 static int write_reg(ads1256_spi_dev_t *dev, uint8_t reg, uint8_t value) {
@@ -77,15 +92,23 @@ static uint8_t map_gain_bits(int gain) {
 }
 
 // Perform single conversion for current MUX & gain: SYNC->WAKEUP->RDATA->read 3 bytes
-static int single_conversion_read(ads1256_spi_dev_t *dev, int32_t *out_raw) {
+static int single_conversion_read(ads1256_system_t *sys, int device_index, ads1256_spi_dev_t *dev, int32_t *out_raw) {
     uint8_t cmd;
     cmd = ADS1256_CMD_SYNC; ads1256_spi_write(dev, &cmd, 1);
     cmd = ADS1256_CMD_WAKEUP; ads1256_spi_write(dev, &cmd, 1);
     // small settle time
-    wait_short();
+    if(device_index >=0 && device_index < sys->cfg.device_count && sys->drdy_handles[device_index] >= 0) {
+        ads1256_gpio_wait_drdy(sys->drdy_handles[device_index], 5); // short timeout
+    } else {
+        wait_short();
+    }
     cmd = ADS1256_CMD_RDATA; ads1256_spi_write(dev, &cmd, 1);
     // Wait t6 (datasheet) ~50 * 1/CLKIN; reuse wait_short minimal for now
-    wait_short();
+    if(device_index >=0 && device_index < sys->cfg.device_count && sys->drdy_handles[device_index] >= 0) {
+        ads1256_gpio_wait_drdy(sys->drdy_handles[device_index], 5);
+    } else {
+        wait_short();
+    }
     return read_sample24(dev, out_raw);
 }
 
@@ -112,8 +135,21 @@ int ads1256_system_create(const ads1256_system_cfg_t *cfg, ads1256_system_t **ou
     s->thread_running = 0;
     s->seq_counter = 0;
     memset(&s->metrics, 0, sizeof(s->metrics));
+    for(int i=0;i<4;i++) s->drdy_handles[i] = -1;
     s->metrics.device_count = s->cfg.device_count;
     s->metrics.channels_total = s->cfg.device_count * 8;
+    s->raw_buf = NULL;
+    s->raw_buf_len = 0;
+    s->use_rdatac = 1;
+    for(int b=0;b<2;b++) {
+        s->bus_worker_enabled[b] = 0;
+        s->bus_thread_running[b] = 0;
+        s->bus_request[b] = 0;
+        s->bus_done[b] = 0;
+        pthread_mutex_init(&s->bus_mutex[b], NULL);
+        pthread_cond_init(&s->bus_cond[b], NULL);
+        pthread_cond_init(&s->bus_done_cond[b], NULL);
+    }
     *out = s;
     return ADS1256_OK;
 }
@@ -130,6 +166,12 @@ int ads1256_system_destroy(ads1256_system_t *sys) {
     if(sys->ring_ready) {
         ads1256_ring_free(&sys->ring);
     }
+    if(sys->raw_buf) free(sys->raw_buf);
+    for(int b=0;b<2;b++) {
+        pthread_mutex_destroy(&sys->bus_mutex[b]);
+        pthread_cond_destroy(&sys->bus_cond[b]);
+        pthread_cond_destroy(&sys->bus_done_cond[b]);
+    }
     free(sys);
     return ADS1256_OK;
 }
@@ -142,6 +184,10 @@ int ads1256_system_start(ads1256_system_t *sys) {
             ads1256_device_cfg_t *dcfg = &sys->cfg.devices[d];
             if(ads1256_spi_open(&sys->spi_devs[d], dcfg->spi_bus, dcfg->chip_select, 1000000) != ADS1256_OK) {
                 continue; // leave unopened; future: mark status
+            }
+            if(dcfg->drdy_chip >= 0 && dcfg->drdy_line >= 0) {
+                int h = ads1256_gpio_open_drdy(dcfg->drdy_chip, dcfg->drdy_line);
+                sys->drdy_handles[d] = h;
             }
             uint8_t cmd = ADS1256_CMD_RESET; ads1256_spi_write(&sys->spi_devs[d], &cmd, 1);
             struct timespec ts = {0, 10000000}; nanosleep(&ts, NULL);
@@ -156,8 +202,18 @@ int ads1256_system_start(ads1256_system_t *sys) {
             write_regs(&sys->spi_devs[d], ADS1256_REG_STATUS, regs, 5);
             cmd = ADS1256_CMD_SELFCAL; ads1256_spi_write(&sys->spi_devs[d], &cmd, 1);
             nanosleep(&ts, NULL);
+            if(sys->use_rdatac) {
+                cmd = ADS1256_CMD_RDATAC; ads1256_spi_write(&sys->spi_devs[d], &cmd, 1);
+            }
         }
         sys->hw_initialized = 1; // mark overall (fine-grain status not tracked yet)
+    }
+    size_t need = (size_t)sys->cfg.device_count * 8;
+    if(need > 0 && (sys->raw_buf == NULL || sys->raw_buf_len < need)) {
+        if(sys->raw_buf) free(sys->raw_buf);
+        sys->raw_buf = (int32_t*)malloc(sizeof(int32_t)*need);
+        if(!sys->raw_buf) return ADS1256_ERR_STATE;
+        sys->raw_buf_len = need;
     }
     sys->running = 1;
     return ADS1256_OK;
@@ -185,11 +241,22 @@ int ads1256_system_read_frame_raw(ads1256_system_t *sys, int32_t *out_raw) {
             write_reg(dev, ADS1256_REG_ADCON, adcon);
             uint8_t mux = (ch << 4) | 0x08;
             write_reg(dev, ADS1256_REG_MUX, mux);
-            wait_short();
-            int32_t raw;
-            int r = single_conversion_read(dev, &raw);
-            if(r != ADS1256_OK) return r;
-            out_raw[d*8 + ch] = raw;
+            if(sys->use_rdatac) {
+                // settle, then discard first, then read real sample
+                if(sys->drdy_handles[d] >= 0) ads1256_gpio_wait_drdy(sys->drdy_handles[d], 10); else wait_short();
+                int32_t discard;
+                read_sample24(dev, &discard);
+                if(sys->drdy_handles[d] >= 0) ads1256_gpio_wait_drdy(sys->drdy_handles[d], 10); else wait_short();
+                int32_t raw;
+                if(read_sample24(dev, &raw) != ADS1256_OK) return ADS1256_ERR_SPI_IO;
+                out_raw[d*8 + ch] = raw;
+            } else {
+                wait_short();
+                int32_t raw;
+                int r = single_conversion_read(sys, d, dev, &raw);
+                if(r != ADS1256_OK) return r;
+                out_raw[d*8 + ch] = raw;
+            }
         }
     }
     return dev_count * 8;
@@ -200,15 +267,23 @@ int ads1256_system_read_frame(ads1256_system_t *sys, float *out_volts) {
     if(!sys->running) return ADS1256_ERR_STATE;
     int channels_total = sys->cfg.device_count * 8;
     if(sys->hw_initialized) {
-        int32_t *raw = (int32_t*)malloc(sizeof(int32_t)*channels_total);
-        if(!raw) return ADS1256_ERR_STATE;
+        if(sys->raw_buf_len < (size_t)channels_total) return ADS1256_ERR_STATE;
+        int32_t *raw = sys->raw_buf;
         int r = ads1256_system_read_frame_raw(sys, raw);
-        if(r < 0) { free(raw); return r; }
-        float vscale = (sys->cfg.vref_mv ? sys->cfg.vref_mv : 2500) / 1000.0f / 8388607.0f;
-        for(int i=0;i<channels_total;i++) {
-            out_volts[i] = raw[i] * vscale;
+        if(r < 0) { return r; }
+        float vref = (sys->cfg.vref_mv ? sys->cfg.vref_mv : 2500) / 1000.0f; // volts
+        for(int d=0; d<sys->cfg.device_count; d++) {
+            for(int ch=0; ch<8; ch++) {
+                int idx = d*8 + ch;
+                int gain = 1;
+                if(sys->cfg.devices[d].channel_count > ch) {
+                    int g = sys->cfg.devices[d].channels[ch].gain;
+                    if(g > 0) gain = g;
+                }
+                float scale = vref / (8388607.0f * (float)gain);
+                out_volts[idx] = raw[idx] * scale;
+            }
         }
-        free(raw);
         return r;
     } else {
         // synthetic single frame
@@ -273,20 +348,59 @@ static void *acq_thread_func(void *arg) {
     ads1256_system_t *sys = (ads1256_system_t*)arg;
     while(sys->thread_running) {
         ads1256_frame_t frame; memset(&frame,0,sizeof(frame));
-        frame.timestamp_ns = monotonic_ns();
+        uint64_t t_start = monotonic_ns();
+        frame.timestamp_ns = t_start;
         frame.seq = sys->seq_counter++;
         frame.device_count = sys->cfg.device_count;
         frame.channels_per_device = 8;
-        // Read one frame (single device prototype) volts into temp array
-        int total = sys->cfg.device_count * 8;
-        if(total > 32) total = 32;
-        float volts[32];
-        int r = ads1256_system_read_frame(sys, volts);
+        int total_channels = sys->cfg.device_count * 8;
+        if(total_channels > 32) total_channels = 32;
+        int r = 0;
+        if(sys->cfg.device_count > 0 && sys->hw_initialized) {
+            // Parallel path if bus workers enabled
+            int parallel = (sys->bus_worker_enabled[0] || sys->bus_worker_enabled[1]);
+            if(parallel) {
+                if(sys->raw_buf_len < (size_t)(sys->cfg.device_count * 8)) {
+                    // raw buffer missing allocation unexpectedly
+                    parallel = 0;
+                }
+            }
+            if(parallel) {
+                bus_request_work(sys); // signal each bus
+                bus_wait_all(sys);     // wait completion
+                // Convert raw buffer to volts
+                float vref = (sys->cfg.vref_mv ? sys->cfg.vref_mv : 2500) / 1000.0f;
+                for(int d=0; d<sys->cfg.device_count; d++) {
+                    for(int ch=0; ch<8; ch++) {
+                        int idx = d*8 + ch;
+                        int gain = 1;
+                        if(sys->cfg.devices[d].channel_count > ch) {
+                            int g = sys->cfg.devices[d].channels[ch].gain;
+                            if(g > 0) gain = g;
+                        }
+                        float scale = vref / (8388607.0f * (float)gain);
+                        float val = sys->raw_buf[idx] * scale;
+                        if(idx < 32) frame.volts[idx] = val;
+                    }
+                }
+                r = sys->cfg.device_count * 8;
+            } else {
+                float volts[32];
+                r = ads1256_system_read_frame(sys, volts);
+                if(r > 0) {
+                    for(int i=0;i<total_channels;i++) frame.volts[i] = volts[i];
+                }
+            }
+        }
         if(r > 0) {
-            for(int i=0;i<total;i++) frame.volts[i] = volts[i];
             ads1256_ring_push(&sys->ring, &frame);
             // Metrics update
             sys->metrics.frames_produced++;
+            uint64_t t_end = monotonic_ns();
+            uint64_t acq_ns = t_end - t_start;
+            sys->metrics.last_frame_acq_ns = acq_ns;
+            if(sys->metrics.avg_frame_acq_ns == 0) sys->metrics.avg_frame_acq_ns = (double)acq_ns;
+            else sys->metrics.avg_frame_acq_ns = 0.9 * sys->metrics.avg_frame_acq_ns + 0.1 * (double)acq_ns;
             uint64_t now = frame.timestamp_ns;
             if(sys->metrics.last_frame_timestamp_ns != 0) {
                 double period = (double)(now - sys->metrics.last_frame_timestamp_ns);
@@ -317,14 +431,121 @@ static void *acq_thread_func(void *arg) {
     return NULL;
 }
 
+typedef struct {
+    ads1256_system_t *sys;
+    int bus;
+} bus_ctx_t;
+
+static void *bus_worker(void *arg) {
+    bus_ctx_t *ctx = (bus_ctx_t*)arg;
+    ads1256_system_t *sys = ctx->sys;
+    int bus = ctx->bus;
+    free(ctx);
+    while(sys->bus_thread_running[bus]) {
+        pthread_mutex_lock(&sys->bus_mutex[bus]);
+        int initial_req = sys->bus_request[bus];
+        while(sys->bus_thread_running[bus] && initial_req == sys->bus_request[bus]) {
+            pthread_cond_wait(&sys->bus_cond[bus], &sys->bus_mutex[bus]);
+        }
+        pthread_mutex_unlock(&sys->bus_mutex[bus]);
+        if(!sys->bus_thread_running[bus]) break;
+        // Process devices on this bus: perform raw reads into shared raw_buf
+        if(sys->hw_initialized && sys->raw_buf) {
+            for(int d=0; d<sys->cfg.device_count; d++) {
+                ads1256_device_cfg_t *dcfg = &sys->cfg.devices[d];
+                if(dcfg->spi_bus != bus) continue;
+                ads1256_spi_dev_t *dev = &sys->spi_devs[d];
+                if(dev->fd < 0) {
+                    for(int ch=0; ch<8; ch++) sys->raw_buf[d*8 + ch] = 0;
+                    continue;
+                }
+                for(int ch=0; ch<8; ch++) {
+                    int gain = 1;
+                    if(sys->cfg.devices[d].channel_count > ch) {
+                        gain = sys->cfg.devices[d].channels[ch].gain;
+                        if(gain <=0) gain = 1;
+                    }
+                    uint8_t adcon = map_gain_bits(gain);
+                    write_reg(dev, ADS1256_REG_ADCON, adcon);
+                    uint8_t mux = (ch << 4) | 0x08;
+                    write_reg(dev, ADS1256_REG_MUX, mux);
+                    if(sys->use_rdatac) {
+                        if(sys->drdy_handles[d] >= 0) ads1256_gpio_wait_drdy(sys->drdy_handles[d], 10); else wait_short();
+                        int32_t discard; read_sample24(dev, &discard);
+                        if(sys->drdy_handles[d] >= 0) ads1256_gpio_wait_drdy(sys->drdy_handles[d], 10); else wait_short();
+                        int32_t raw; read_sample24(dev, &raw);
+                        sys->raw_buf[d*8 + ch] = raw;
+                    } else {
+                        wait_short();
+                        int32_t raw;
+                        if(single_conversion_read(sys, d, dev, &raw) == ADS1256_OK) {
+                            sys->raw_buf[d*8 + ch] = raw;
+                        } else {
+                            sys->raw_buf[d*8 + ch] = 0;
+                        }
+                    }
+                }
+            }
+        }
+        pthread_mutex_lock(&sys->bus_mutex[bus]);
+        sys->bus_done[bus]++;
+        pthread_cond_broadcast(&sys->bus_done_cond[bus]);
+        pthread_mutex_unlock(&sys->bus_mutex[bus]);
+    }
+    return NULL;
+}
+
+static void bus_request_work(ads1256_system_t *sys) {
+    for(int bus=0; bus<2; bus++) {
+        if(!sys->bus_worker_enabled[bus]) continue;
+        pthread_mutex_lock(&sys->bus_mutex[bus]);
+        sys->bus_request[bus]++;
+        pthread_cond_signal(&sys->bus_cond[bus]);
+        pthread_mutex_unlock(&sys->bus_mutex[bus]);
+    }
+}
+
+static void bus_wait_all(ads1256_system_t *sys) {
+    for(int bus=0; bus<2; bus++) {
+        if(!sys->bus_worker_enabled[bus]) continue;
+        pthread_mutex_lock(&sys->bus_mutex[bus]);
+        int target = sys->bus_request[bus];
+        while(sys->bus_done[bus] < target) {
+            pthread_cond_wait(&sys->bus_done_cond[bus], &sys->bus_mutex[bus]);
+        }
+        pthread_mutex_unlock(&sys->bus_mutex[bus]);
+    }
+}
+
 int ads1256_system_start_thread(ads1256_system_t *sys) {
     if(!sys) return ADS1256_ERR_INVALID_ARG;
     if(!sys->ring_ready) {
         if(ads1256_ring_init(&sys->ring, 256) != 0) return ADS1256_ERR_STATE;
         sys->ring_ready = 1;
+    for(int i=0;i<4;i++) if(sys->drdy_handles[i] >= 0) ads1256_gpio_close(sys->drdy_handles[i]);
     }
     if(sys->thread_running) return ADS1256_ERR_ALREADY_INITIALIZED;
     sys->thread_running = 1;
+#ifdef __linux__
+    // Determine which buses are used
+    int used_bus[2] = {0,0};
+    for(int d=0; d<sys->cfg.device_count; d++) {
+        int b = sys->cfg.devices[d].spi_bus;
+        if(b>=0 && b<2) used_bus[b] = 1;
+    }
+    for(int b=0;b<2;b++) {
+        if(used_bus[b]) {
+            sys->bus_worker_enabled[b] = 1;
+            sys->bus_thread_running[b] = 1;
+            bus_ctx_t *ctx = (bus_ctx_t*)malloc(sizeof(bus_ctx_t));
+            ctx->sys = sys; ctx->bus = b;
+            if(pthread_create(&sys->bus_threads[b], NULL, bus_worker, ctx) != 0) {
+                sys->bus_thread_running[b] = 0;
+                sys->bus_worker_enabled[b] = 0;
+            }
+        }
+    }
+#endif
 #ifdef __linux__
     if(pthread_create(&sys->thread, NULL, acq_thread_func, sys) != 0) {
         sys->thread_running = 0; return ADS1256_ERR_STATE;
@@ -341,6 +562,16 @@ int ads1256_system_stop_thread(ads1256_system_t *sys) {
     sys->thread_running = 0;
 #ifdef __linux__
     pthread_join(sys->thread, NULL);
+    // stop bus workers
+    for(int b=0;b<2;b++) {
+        if(sys->bus_thread_running[b]) {
+            pthread_mutex_lock(&sys->bus_mutex[b]);
+            sys->bus_thread_running[b] = 0;
+            pthread_cond_broadcast(&sys->bus_cond[b]);
+            pthread_mutex_unlock(&sys->bus_mutex[b]);
+            pthread_join(sys->bus_threads[b], NULL);
+        }
+    }
 #endif
     return ADS1256_OK;
 }
@@ -359,6 +590,16 @@ int ads1256_system_get_dropped(ads1256_system_t *sys, unsigned long long *out_dr
     return ADS1256_OK;
 }
 
+int ads1256_system_pop_frame_ref(ads1256_system_t *sys, const ads1256_frame_t **out_frame) {
+    if(!sys || !out_frame) return ADS1256_ERR_INVALID_ARG;
+    if(!sys->ring_ready) return 0;
+    ads1256_ring_t *r = &sys->ring;
+    if(r->read_idx == r->write_idx) return 0; // empty
+    *out_frame = &r->frames[r->read_idx];
+    r->read_idx = (r->read_idx + 1) % r->capacity;
+    return 1;
+}
+
 int ads1256_system_get_metrics(ads1256_system_t *sys, ads1256_metrics_t *out) {
     if(!sys || !out) return ADS1256_ERR_INVALID_ARG;
     *out = sys->metrics;
@@ -368,6 +609,8 @@ int ads1256_system_get_metrics(ads1256_system_t *sys, ads1256_metrics_t *out) {
 int ads1256_system_wait_drdy(ads1256_system_t *sys, int device_index, int timeout_ms) {
     if(!sys) return ADS1256_ERR_INVALID_ARG;
     if(device_index < 0 || device_index >= sys->cfg.device_count) return ADS1256_ERR_INVALID_ARG;
+    sys->metrics.drdy_waits++;
+    uint64_t start_ns = monotonic_ns();
     // Placeholder: no GPIO integration yet. We approximate wait by sleeping a short fraction of expected sample period.
     int sr = sys->cfg.devices[device_index].sample_rate;
     if(sr <= 0) sr = 7500;
@@ -384,7 +627,14 @@ int ads1256_system_wait_drdy(ads1256_system_t *sys, int device_index, int timeou
         nanosleep(&ts, NULL);
         waited_ms += (step_us / 1000);
         // Without GPIO can't detect readiness; assume ready after first interval.
+        sys->metrics.last_drdy_wait_ns = monotonic_ns() - start_ns;
+        if(sys->metrics.avg_drdy_wait_ns == 0)
+            sys->metrics.avg_drdy_wait_ns = (double)sys->metrics.last_drdy_wait_ns;
+        else
+            sys->metrics.avg_drdy_wait_ns = 0.9 * sys->metrics.avg_drdy_wait_ns + 0.1 * (double)sys->metrics.last_drdy_wait_ns;
         return 1;
     }
+    sys->metrics.drdy_timeouts++;
+    sys->metrics.last_drdy_wait_ns = monotonic_ns() - start_ns;
     return 0; // timeout
 }
