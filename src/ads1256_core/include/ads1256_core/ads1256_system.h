@@ -25,6 +25,17 @@ int ads1256_system_stop(ads1256_system_t *sys);
 // Read synthetic samples (float volts) into provided buffer; returns samples per channel
 int ads1256_system_read_voltages(ads1256_system_t *sys, float *out, int max_samples);
 
+// Read one frame (all channels for each device) using channel sweep (blocking); returns channels_total or error
+int ads1256_system_read_frame(ads1256_system_t *sys, float *out_volts);
+
+// (Future) raw frame variant
+int ads1256_system_read_frame_raw(ads1256_system_t *sys, int32_t *out_raw);
+
+// Start background acquisition thread for single-device prototype (frames into ring)
+int ads1256_system_start_thread(ads1256_system_t *sys);
+int ads1256_system_stop_thread(ads1256_system_t *sys);
+int ads1256_system_pop_frame(ads1256_system_t *sys, ads1256_frame_t *out_frame); // returns 1 frame, 0 empty, <0 error
+
 #ifdef __cplusplus
 }
 #endif

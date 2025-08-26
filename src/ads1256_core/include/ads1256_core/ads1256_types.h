@@ -29,6 +29,7 @@ typedef struct {
     int rt_priority;
     int device_count;
     ads1256_device_cfg_t devices[4];
+    int vref_mv;        // reference voltage in millivolts (all devices for now)
 } ads1256_system_cfg_t;
 
 #endif // ADS1256_TYPES_H
