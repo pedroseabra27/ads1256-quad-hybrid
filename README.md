@@ -11,7 +11,7 @@ Este repositório agora contém a estrutura inicial do core C, API Python e docu
 | 4 devices (ADS1256) | Implemented (sequential + parallel per bus) |
 | Dual SPI (SPI0/SPI1) | Active (bus worker threads) |
 | RDATAC mode | Basic (MUX sweep with discard+read) |
-| DRDY (GPIO) | Abstraction + metrics (libgpiod integration flag pending) |
+| DRDY (GPIO) | Abstraction + metrics (auto-detect libgpiod) |
 | Zero-copy frame access | Implemented (`pop_frame_view`) |
 | Per-channel gain scaling | Implemented |
 | Multi-thread acquisition | Main + per-bus workers |
@@ -33,12 +33,12 @@ source .venv/bin/activate
 pip install -e .[dev]
 # (compila extensão Cython; se falhar use: python setup.py build_ext --inplace)
 
-# Optional: enable libgpiod DRDY edge timing (Linux/RPi)
-# Install system dependency:
+# Edge-driven DRDY (libgpiod) is auto-detected if development headers are installed.
+# To enable on Raspberry Pi / Debian-based:
 #   sudo apt update && sudo apt install -y libgpiod-dev gpiod
-# Build with flag:
-#   CFLAGS="-DADS1256_HAVE_GPIOD" pip install -e .
-# Or set environment before building the extension.
+# Then reinstall: pip install -e .
+# To force disable even if present: set ADS1256_FORCE_NO_GPIOD=1
+# Detection messages appear during build (stderr).
 ```
 
 ## Quick Test

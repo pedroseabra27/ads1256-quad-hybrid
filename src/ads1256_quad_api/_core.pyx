@@ -6,6 +6,17 @@ cimport numpy as np
 
 cimport ads1256_quad_api._core as ccore
 
+cdef extern from "ads1256_core/ads1256_log.h":
+    void ads1256_log_set_level(int level)
+    int ads1256_log_get_level()
+
+def set_log_level(level:int):
+    """Define log level (10=DEBUG,20=INFO,30=WARN,40=ERROR)."""
+    ads1256_log_set_level(level)
+
+def get_log_level():
+    return ads1256_log_get_level()
+
 cdef class CoreSystem:
     cdef ccore.ads1256_system_t *sys
     cdef bint started
@@ -158,6 +169,12 @@ cdef class CoreSystem:
             "frames_produced": m.frames_produced,
             "dropped_frames": m.dropped_frames,
             "avg_frame_period_ns": m.avg_frame_period_ns,
+            "rms_frame_jitter_ns": m.rms_frame_jitter_ns,
+            "max_frame_jitter_ns": m.max_frame_jitter_ns,
+            "jitter_hist": [
+                m.jitter_hist[0], m.jitter_hist[1], m.jitter_hist[2], m.jitter_hist[3],
+                m.jitter_hist[4], m.jitter_hist[5], m.jitter_hist[6], m.jitter_hist[7]
+            ],
             "last_frame_acq_ns": m.last_frame_acq_ns,
             "avg_frame_acq_ns": m.avg_frame_acq_ns,
             "drdy_waits": m.drdy_waits,

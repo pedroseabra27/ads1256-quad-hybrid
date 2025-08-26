@@ -1,6 +1,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <math.h>
+#include "include/ads1256_core/ads1256_log.h"
 #include <time.h>
 
 #include "include/ads1256_core/ads1256_system.h"
@@ -98,14 +100,14 @@ static int single_conversion_read(ads1256_system_t *sys, int device_index, ads12
     cmd = ADS1256_CMD_WAKEUP; ads1256_spi_write(dev, &cmd, 1);
     // small settle time
     if(device_index >=0 && device_index < sys->cfg.device_count && sys->drdy_handles[device_index] >= 0) {
-        ads1256_gpio_wait_drdy(sys->drdy_handles[device_index], 5); // short timeout
+        ads1256_system_wait_drdy(sys, device_index, 5); // short timeout
     } else {
         wait_short();
     }
     cmd = ADS1256_CMD_RDATA; ads1256_spi_write(dev, &cmd, 1);
     // Wait t6 (datasheet) ~50 * 1/CLKIN; reuse wait_short minimal for now
     if(device_index >=0 && device_index < sys->cfg.device_count && sys->drdy_handles[device_index] >= 0) {
-        ads1256_gpio_wait_drdy(sys->drdy_handles[device_index], 5);
+        ads1256_system_wait_drdy(sys, device_index, 5);
     } else {
         wait_short();
     }
@@ -216,6 +218,7 @@ int ads1256_system_start(ads1256_system_t *sys) {
         sys->raw_buf_len = need;
     }
     sys->running = 1;
+    ADS1256_LOGI("system start (devices=%d)", sys->cfg.device_count);
     return ADS1256_OK;
 }
 
@@ -243,10 +246,10 @@ int ads1256_system_read_frame_raw(ads1256_system_t *sys, int32_t *out_raw) {
             write_reg(dev, ADS1256_REG_MUX, mux);
             if(sys->use_rdatac) {
                 // settle, then discard first, then read real sample
-                if(sys->drdy_handles[d] >= 0) ads1256_gpio_wait_drdy(sys->drdy_handles[d], 10); else wait_short();
+                if(sys->drdy_handles[d] >= 0) ads1256_system_wait_drdy(sys, d, 10); else wait_short();
                 int32_t discard;
                 read_sample24(dev, &discard);
-                if(sys->drdy_handles[d] >= 0) ads1256_gpio_wait_drdy(sys->drdy_handles[d], 10); else wait_short();
+                if(sys->drdy_handles[d] >= 0) ads1256_system_wait_drdy(sys, d, 10); else wait_short();
                 int32_t raw;
                 if(read_sample24(dev, &raw) != ADS1256_OK) return ADS1256_ERR_SPI_IO;
                 out_raw[d*8 + ch] = raw;
@@ -297,6 +300,7 @@ int ads1256_system_read_frame(ads1256_system_t *sys, float *out_volts) {
 int ads1256_system_stop(ads1256_system_t *sys) {
     if(!sys) return ADS1256_ERR_INVALID_ARG;
     sys->running = 0;
+    ADS1256_LOGI("system stop");
     return ADS1256_OK;
 }
 
@@ -346,6 +350,7 @@ static uint64_t monotonic_ns() {
 
 static void *acq_thread_func(void *arg) {
     ads1256_system_t *sys = (ads1256_system_t*)arg;
+    ADS1256_LOGI("acquisition thread started");
     while(sys->thread_running) {
         ads1256_frame_t frame; memset(&frame,0,sizeof(frame));
         uint64_t t_start = monotonic_ns();
@@ -404,8 +409,38 @@ static void *acq_thread_func(void *arg) {
             uint64_t now = frame.timestamp_ns;
             if(sys->metrics.last_frame_timestamp_ns != 0) {
                 double period = (double)(now - sys->metrics.last_frame_timestamp_ns);
-                if(sys->metrics.avg_frame_period_ns == 0) sys->metrics.avg_frame_period_ns = period;
-                else sys->metrics.avg_frame_period_ns = 0.9 * sys->metrics.avg_frame_period_ns + 0.1 * period;
+                if(sys->metrics.avg_frame_period_ns == 0) {
+                    sys->metrics.avg_frame_period_ns = period;
+                    sys->metrics.rms_frame_jitter_ns = 0.0;
+                    sys->metrics.max_frame_jitter_ns = 0.0;
+                } else {
+                    double prev_avg = sys->metrics.avg_frame_period_ns;
+                    double new_avg = 0.9 * prev_avg + 0.1 * period;
+                    double jitter = period - new_avg; // centered on updated avg (approx)
+                    // Update RMS jitter with exponential window similar to avg
+                    double prev_rms2 = sys->metrics.rms_frame_jitter_ns * sys->metrics.rms_frame_jitter_ns;
+                    double new_rms2 = 0.95 * prev_rms2 + 0.05 * (jitter * jitter);
+                    double new_rms = 0.0;
+                    if(new_rms2 > 0) {
+                        // simple sqrt; could approximate to avoid math overhead
+                        new_rms = sqrt(new_rms2);
+                    }
+                    sys->metrics.avg_frame_period_ns = new_avg;
+                    sys->metrics.rms_frame_jitter_ns = new_rms;
+                    double abs_jitter = jitter < 0 ? -jitter : jitter;
+                    if(abs_jitter > sys->metrics.max_frame_jitter_ns) sys->metrics.max_frame_jitter_ns = abs_jitter;
+                    // Histogram bucket (ns)
+                    uint64_t aj = (uint64_t)(abs_jitter < 0 ? 0 : abs_jitter);
+                    int b = 7;
+                    if(aj < 1000) b = 0;
+                    else if(aj < 2000) b = 1;
+                    else if(aj < 5000) b = 2;
+                    else if(aj < 10000) b = 3;
+                    else if(aj < 20000) b = 4;
+                    else if(aj < 50000) b = 5;
+                    else if(aj < 100000) b = 6;
+                    sys->metrics.jitter_hist[b]++;
+                }
             }
             sys->metrics.last_frame_timestamp_ns = frame.timestamp_ns;
             sys->metrics.dropped_frames = sys->ring.dropped;
@@ -428,6 +463,7 @@ static void *acq_thread_func(void *arg) {
             nanosleep(&ts, NULL);
         }
     }
+    ADS1256_LOGI("acquisition thread exiting");
     return NULL;
 }
 
@@ -470,9 +506,9 @@ static void *bus_worker(void *arg) {
                     uint8_t mux = (ch << 4) | 0x08;
                     write_reg(dev, ADS1256_REG_MUX, mux);
                     if(sys->use_rdatac) {
-                        if(sys->drdy_handles[d] >= 0) ads1256_gpio_wait_drdy(sys->drdy_handles[d], 10); else wait_short();
+                        if(sys->drdy_handles[d] >= 0) ads1256_system_wait_drdy(sys, d, 10); else wait_short();
                         int32_t discard; read_sample24(dev, &discard);
-                        if(sys->drdy_handles[d] >= 0) ads1256_gpio_wait_drdy(sys->drdy_handles[d], 10); else wait_short();
+                        if(sys->drdy_handles[d] >= 0) ads1256_system_wait_drdy(sys, d, 10); else wait_short();
                         int32_t raw; read_sample24(dev, &raw);
                         sys->raw_buf[d*8 + ch] = raw;
                     } else {
