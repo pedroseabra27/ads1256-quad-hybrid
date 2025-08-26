@@ -8,6 +8,9 @@
 #include "include/ads1256_core/ads1256_regs.h"
 #include "include/ads1256_core/ads1256_ring.h"
 #include "include/ads1256_core/ads1256_frame.h"
+#ifdef __linux__
+#include <pthread.h>
+#endif
 
 struct ads1256_system_s {
     ads1256_system_cfg_t cfg;
@@ -128,32 +131,27 @@ int ads1256_system_destroy(ads1256_system_t *sys) {
 int ads1256_system_start(ads1256_system_t *sys) {
     if(!sys) return ADS1256_ERR_INVALID_ARG;
     // attempt simple hardware init for first device if present
-    if(sys->cfg.device_count > 0) {
-        ads1256_device_cfg_t *d0 = &sys->cfg.devices[0];
-        if(!sys->hw_initialized) {
-            if(ads1256_spi_open(&sys->spi_devs[0], d0->spi_bus, d0->chip_select, 1000000) == ADS1256_OK) {
-                // Basic init sequence (blocking, minimal error handling)
-                uint8_t cmd;
-                cmd = ADS1256_CMD_RESET; ads1256_spi_write(&sys->spi_devs[0], &cmd, 1);
-                struct timespec ts = {0, 10000000}; // 10ms
-                nanosleep(&ts, NULL);
-                cmd = ADS1256_CMD_SDATAC; ads1256_spi_write(&sys->spi_devs[0], &cmd, 1);
-                // Compose initial register block (STATUS, MUX, ADCON, DRATE, IO)
-                uint8_t regs[5];
-                regs[0] = 0x00; // STATUS: ORDER=0, ACAL=0, BUFEN=0
-                regs[1] = 0x08; // MUX: AINP=0 AINN=COM initial
-                uint8_t gain_bits = map_gain_bits(1);
-                regs[2] = (0x00 << 3) | gain_bits; // ADCON: clock out off, gain set
-                regs[3] = map_drate(d0->sample_rate);
-                regs[4] = 0x00; // IO
-                write_regs(&sys->spi_devs[0], ADS1256_REG_STATUS, regs, 5);
-                // Self calib (system offset/gain could be done; basic only)
-                cmd = ADS1256_CMD_SELFCAL; ads1256_spi_write(&sys->spi_devs[0], &cmd, 1);
-                nanosleep(&ts, NULL);
-                // Stay in SDATAC mode for manual per-channel conversions (avoid RDATAC during MUX switching)
-                sys->hw_initialized = 1;
+    if(sys->cfg.device_count > 0 && !sys->hw_initialized) {
+        for(int d=0; d<sys->cfg.device_count; d++) {
+            ads1256_device_cfg_t *dcfg = &sys->cfg.devices[d];
+            if(ads1256_spi_open(&sys->spi_devs[d], dcfg->spi_bus, dcfg->chip_select, 1000000) != ADS1256_OK) {
+                continue; // leave unopened; future: mark status
             }
+            uint8_t cmd = ADS1256_CMD_RESET; ads1256_spi_write(&sys->spi_devs[d], &cmd, 1);
+            struct timespec ts = {0, 10000000}; nanosleep(&ts, NULL);
+            cmd = ADS1256_CMD_SDATAC; ads1256_spi_write(&sys->spi_devs[d], &cmd, 1);
+            uint8_t regs[5];
+            regs[0] = 0x00;
+            regs[1] = 0x08; // CH0 vs COM init
+            uint8_t gain_bits = map_gain_bits(1);
+            regs[2] = (0x00 << 3) | gain_bits;
+            regs[3] = map_drate(dcfg->sample_rate);
+            regs[4] = 0x00;
+            write_regs(&sys->spi_devs[d], ADS1256_REG_STATUS, regs, 5);
+            cmd = ADS1256_CMD_SELFCAL; ads1256_spi_write(&sys->spi_devs[d], &cmd, 1);
+            nanosleep(&ts, NULL);
         }
+        sys->hw_initialized = 1; // mark overall (fine-grain status not tracked yet)
     }
     sys->running = 1;
     return ADS1256_OK;
@@ -163,28 +161,32 @@ int ads1256_system_read_frame_raw(ads1256_system_t *sys, int32_t *out_raw) {
     if(!sys || !out_raw) return ADS1256_ERR_INVALID_ARG;
     if(!sys->running) return ADS1256_ERR_STATE;
     if(!sys->hw_initialized) return ADS1256_ERR_STATE;
-    // Sweep 8 channels via MUX (single device prototype)
-    ads1256_spi_dev_t *dev = &sys->spi_devs[0];
-    // Use config from device cfg channels if available
-    for(int ch=0; ch<8; ch++) {
-        // Gain selection per channel (if configured)
-        int gain = 1;
-        if(sys->cfg.devices[0].channel_count > ch) {
-            gain = sys->cfg.devices[0].channels[ch].gain;
-            if(gain <=0) gain = 1;
+    int dev_count = sys->cfg.device_count;
+    for(int d=0; d<dev_count; d++) {
+        ads1256_spi_dev_t *dev = &sys->spi_devs[d];
+        if(dev->fd < 0) {
+            // fill zeros for unopened device
+            for(int ch=0; ch<8; ch++) out_raw[d*8 + ch] = 0;
+            continue;
         }
-        uint8_t adcon = map_gain_bits(gain);
-        write_reg(dev, ADS1256_REG_ADCON, adcon);
-        // MUX: positive channel ch, negative COM (0x08 lower nibble)
-        uint8_t mux = (ch << 4) | 0x08;
-        write_reg(dev, ADS1256_REG_MUX, mux);
-        wait_short();
-        int32_t raw;
-        int r = single_conversion_read(dev, &raw);
-        if(r != ADS1256_OK) return r;
-        out_raw[ch] = raw;
+        for(int ch=0; ch<8; ch++) {
+            int gain = 1;
+            if(sys->cfg.devices[d].channel_count > ch) {
+                gain = sys->cfg.devices[d].channels[ch].gain;
+                if(gain <=0) gain = 1;
+            }
+            uint8_t adcon = map_gain_bits(gain);
+            write_reg(dev, ADS1256_REG_ADCON, adcon);
+            uint8_t mux = (ch << 4) | 0x08;
+            write_reg(dev, ADS1256_REG_MUX, mux);
+            wait_short();
+            int32_t raw;
+            int r = single_conversion_read(dev, &raw);
+            if(r != ADS1256_OK) return r;
+            out_raw[d*8 + ch] = raw;
+        }
     }
-    return 8;
+    return dev_count * 8;
 }
 
 int ads1256_system_read_frame(ads1256_system_t *sys, float *out_volts) {
@@ -192,18 +194,16 @@ int ads1256_system_read_frame(ads1256_system_t *sys, float *out_volts) {
     if(!sys->running) return ADS1256_ERR_STATE;
     int channels_total = sys->cfg.device_count * 8;
     if(sys->hw_initialized) {
-        int32_t raw[8];
+        int32_t *raw = (int32_t*)malloc(sizeof(int32_t)*channels_total);
+        if(!raw) return ADS1256_ERR_STATE;
         int r = ads1256_system_read_frame_raw(sys, raw);
-        if(r < 0) return r;
+        if(r < 0) { free(raw); return r; }
         float vscale = (sys->cfg.vref_mv ? sys->cfg.vref_mv : 2500) / 1000.0f / 8388607.0f;
-        for(int ch=0; ch<8; ch++) {
-            float volts = raw[ch] * vscale;
-            for(int d=0; d<sys->cfg.device_count; d++) { // replicate to all devices for now until multi-dev implemented
-                int idx = d*8 + ch;
-                out_volts[idx] = volts;
-            }
+        for(int i=0;i<channels_total;i++) {
+            out_volts[i] = raw[i] * vscale;
         }
-        return channels_total;
+        free(raw);
+        return r;
     } else {
         // synthetic single frame
         for(int ch=0; ch<channels_total; ch++) {
@@ -272,11 +272,11 @@ static void *acq_thread_func(void *arg) {
         frame.device_count = sys->cfg.device_count;
         frame.channels_per_device = 8;
         // Read one frame (single device prototype) volts into temp array
+        int total = sys->cfg.device_count * 8;
+        if(total > 32) total = 32;
         float volts[32];
         int r = ads1256_system_read_frame(sys, volts);
         if(r > 0) {
-            int total = sys->cfg.device_count * 8;
-            if(total > 32) total = 32;
             for(int i=0;i<total;i++) frame.volts[i] = volts[i];
             ads1256_ring_push(&sys->ring, &frame);
         }
@@ -320,4 +320,11 @@ int ads1256_system_pop_frame(ads1256_system_t *sys, ads1256_frame_t *out_frame) 
     if(!sys->ring_ready) return 0;
     int r = ads1256_ring_pop(&sys->ring, out_frame);
     return r;
+}
+
+int ads1256_system_get_dropped(ads1256_system_t *sys, unsigned long long *out_dropped) {
+    if(!sys || !out_dropped) return ADS1256_ERR_INVALID_ARG;
+    if(!sys->ring_ready) { *out_dropped = 0; return ADS1256_OK; }
+    *out_dropped = sys->ring.dropped;
+    return ADS1256_OK;
 }

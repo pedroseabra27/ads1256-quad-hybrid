@@ -25,12 +25,15 @@ Badge (CI): ![CI](https://github.com/pedroseabra27/ads1256-quad-hybrid/actions/w
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .[dev]
+# (compila extensão Cython; se falhar use: python setup.py build_ext --inplace)
 ```
 
 ## Quick Test
 
 ```bash
 python examples/basic_quad_test.py
+# Test hardware (necessita SPI devices e permissões):
+python examples/hw_thread_read.py
 ```
 
 ## Example (Python)

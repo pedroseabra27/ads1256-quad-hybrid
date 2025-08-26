@@ -20,3 +20,7 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.ext_modules]
+# Declarative not fully supported for Cython here; fallback to setup.cfg alternative would be possible.
+

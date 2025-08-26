@@ -13,3 +13,9 @@ __all__ = [
     "ChannelSettings",
     "create_default_system",
 ]
+
+try:
+    from ._core import CoreSystem  # Cython hardware-backed system
+    __all__.append("CoreSystem")
+except Exception:  # pragma: no cover
+    pass
