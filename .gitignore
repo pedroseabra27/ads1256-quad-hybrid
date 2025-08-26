@@ -1,0 +1,13 @@
+.venv/
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.so
+*.pyc
+.profile
+.DS_Store
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
